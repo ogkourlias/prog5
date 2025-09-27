@@ -17,27 +17,30 @@ import argparse
 import numpy as np
 from mpi4py import MPI
 
+
 def argparser():
     """Argument parser"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", "-n", default=2, type=int)
     return parser.parse_args()
 
+
 # FUNCTIONS
 def sieve_erat(n):
-    """ Desc """
+    """Desc"""
     end = int(np.sqrt(n))
-    bools = np.ones(n-2)
+    bools = np.ones(n - 2)
     for i in range(0, end):
         if bools[i]:
             # Parallelize here
-            num = i+2
+            num = i + 2
             for j in range(num**2, n, num):
-                bools[j-2] = 0
+                bools[j - 2] = 0
     return bools
 
+
 def sieve_erat_mpi(n):
-    """ Desc """
+    """Desc"""
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -45,13 +48,13 @@ def sieve_erat_mpi(n):
     end = int(np.sqrt(n))
 
     if rank == 0:
-        # Made things needlessly difficult by not including 0 and 1 
+        # Made things needlessly difficult by not including 0 and 1
         # In the prior iteration.
-        base = np.ones(end+1, dtype=bool)
+        base = np.ones(end + 1, dtype=bool)
         base[0:2] = False
         for i in range(2, end + 1):
             if base[i]:
-                base[i*i:end+1:i] = False
+                base[i * i : end + 1 : i] = False
         base_primes = np.nonzero(base)[0]
     else:
         base_primes = None
@@ -67,28 +70,31 @@ def sieve_erat_mpi(n):
     seg = np.ones(stop - start, dtype=bool)
     for p in base_primes:
         s = max(p * p, ((start + p - 1) // p) * p)
-        seg[s - start:stop - start:p] = False
+        seg[s - start : stop - start : p] = False
 
     loc = np.nonzero(seg)[0] + start
     gathered = comm.gather(loc, root=0)
 
     if rank == 0:
-        all_primes = np.concatenate((base_primes, np.concatenate(gathered))) if gathered else base_primes
+        all_primes = (
+            np.concatenate((base_primes, np.concatenate(gathered)))
+            if gathered
+            else base_primes
+        )
         return all_primes
     else:
         return None
 
 
-
 # MAIN
 def main(args):
-    """ Main function """
+    """Main function"""
     # FINISH
     args = argparser()
-    cProfile.run(f'sieve_erat_mpi({args.steps})', "sieve_profiler_output.txt")
+    cProfile.run(f"sieve_erat_mpi({args.steps})", "sieve_profiler_output.txt")
     # sieve_erat_mpi(80000)
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main(sys.argv))
