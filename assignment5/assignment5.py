@@ -13,13 +13,14 @@ __version__ = "0.1"
 # IMPORTS
 import argparse
 import sys
+
+sys.path.append("/opt/spark/python")
+sys.path.append("/opt/spark/python/lib/py4j-0.10.9.7-src.zip")
+
 import pyspark.sql.functions as sf
 from Bio import SeqIO
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType
-
-sys.path.append("/opt/spark/python")
-sys.path.append("/opt/spark/python/lib/py4j-0.10.9.7-src.zip")
 
 def argparser():
     """Argument parser"""
