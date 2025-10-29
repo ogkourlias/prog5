@@ -11,75 +11,148 @@ __status__ = "WIP"
 __version__ = "0.1"
 
 # IMPORTS
-
-import argparse
+import os
 import sys
+import argparse
+import configparser
+
 sys.path.append("/opt/spark/python")
 sys.path.append("/opt/spark/python/lib/py4j-0.10.9.7-src.zip")
 
-import pyspark.sql.functions as sf
-from Bio import SeqIO
-import numpy as np
+from pyspark.sql.functions import monotonically_increasing_id
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
-from pyspark.sql.functions import isnan, when, count, col, concat_ws, sum, coalesce, lit, length, regexp_replace, monotonically_increasing_id
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, when, concat_ws
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
 from functools import reduce
+import operator
+
 
 def argparser():
-    """Argument parser"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", "-i", default=2, type=str)
+    parser.add_argument("--input", "-i", required=True, type=str,
+                        help="input TSV file path")
     return parser.parse_args()
 
-def parse_file(input_f):
-    # Create SparkSession
-    spark = (
-        SparkSession.builder.appName("assignment6_ogkourlias")
-        # .master("spark://spark.bin.bioinf.nl:7077")
+def create_spark(app_name: str = "assignment6_ogkourlias") -> SparkSession:
+    return (
+        SparkSession.builder
+        .appName(app_name)
         .master("local[*]")
-        .config("spark.jars", "/path/to/mariadb-java-client-3.5.0.jar")
-        .config("spark.executor.memory", "8g")
+        .config("spark.jars", "/students/2025-2026/master/orfeas/prog5/assignment6/mariadb-java-client-3.5.6.jar")
+        .config("spark.executor.memory", "16g")
+        .config("spark.executor.cores", "4")
+        .config("spark.local.dir", "/students/2025-2026/master/orfeas/prog5/assignment6/spark-temp")
+        .config("spark.sql.adaptive.enabled", "true")
         .getOrCreate()
     )
 
-    # Read CSV File
-    df = spark.read.csv(input_f, sep="\t", header=True)
-    pred_cols = np.array([col for col in df.columns if "pred" in col.lower()])
-    df = df.repartition(*pred_cols)
-    counts = [df.filter((col(column) == ".") | (col(column) == ".;")).count() for column in pred_cols]
-    desc_idx = np.argsort(counts)
-    top_pred_cols = pred_cols[desc_idx[:5]]
-    top_pred_cols = np.concatenate((["#chr", "pos(1-based)", "Ensembl_proteinid"], top_pred_cols))
-    df = df.select(*top_pred_cols)
+def read_db_credentials():
+    cfg = configparser.ConfigParser()
+    cfg.read(os.path.expanduser("~/.my.cnf"))
+    user = cfg.get("client", "user")
+    password = cfg.get("client", "password")
+    return user, password
 
-    col_list = [col(column) for column in top_pred_cols[3:]]
+def parse_file(spark: SparkSession, input_f: str, user: str, password: str):
+    df = spark.read.csv(input_f, sep="\t", header=True, inferSchema=False)
+
+    pred_cols = [c for c in df.columns if "pred" in c.lower()]
+
+    df = df.repartition(8)
+
+    missing_count_exprs = [
+        F.sum(when(col(c).isin(".", ".;"), 1).otherwise(0)).alias(c)
+        for c in pred_cols
+    ]
+    counts_row = df.select(*missing_count_exprs).collect()[0].asDict()
+
+    sorted_preds = sorted(pred_cols, key=lambda c: counts_row.get(c, 0))
+    top5 = sorted_preds[:5]
+
+    id_keys = ["#chr", "pos(1-based)", "Ensembl_proteinid"]
+    present_id_keys = [k for k in id_keys if k in df.columns]
+
+    df = df.dropDuplicates(present_id_keys)
+
     df = df.withColumn("snp_chr", concat_ws("_", col("#chr"), col("pos(1-based)")))
-    df = df.withColumn("pred_str", concat_ws("", *col_list))
-    df = df.withColumn("nan_count", length("pred_str") - length(regexp_replace("pred_str", r'\.;|\.', "")))
-    df = df.sort(col("nan_count"), ascending=True)
-    df = df.dropDuplicates()
-    pred_df = df.select([*col_list, col("nan_count"), col("snp_chr"), col("Ensembl_proteinid")])
-    snp_df = df.select([col("snp_chr")]).dropDuplicates()
-    protein_df = df.select([col("Ensembl_proteinid")]).dropDuplicates()
-    pred_df = pred_df.withColumn("id", monotonically_increasing_id())
+
+    nan_flags = [when(col(c).isin(".", ".;"), 1).otherwise(0) for c in top5]
+    nan_count_expr = reduce(operator.add, nan_flags)
+    df = df.withColumn("nan_count", nan_count_expr)
+
+    pred_select_cols = [col(c) for c in top5]
+    pred_df = df.select(*pred_select_cols, col("nan_count"), col("snp_chr"), col("Ensembl_proteinid"))
+
+    snp_df = df.select("snp_chr").distinct()
+    protein_df = df.select("Ensembl_proteinid").distinct()
+
+    snp_window = Window.orderBy("snp_chr")
+    snp_df = snp_df.withColumn("snp_id", row_number().over(snp_window))
     snp_df = snp_df.withColumn("snp_id", monotonically_increasing_id())
+
+    protein_window = Window.orderBy("Ensembl_proteinid")
+    protein_df = protein_df.withColumn("protein_id", row_number().over(protein_window))
     protein_df = protein_df.withColumn("protein_id", monotonically_increasing_id())
+
+    pred_window = Window.orderBy("snp_chr", "Ensembl_proteinid")
+    pred_df = pred_df.withColumn("id", row_number().over(pred_window))
+
     pred_df = pred_df.join(snp_df, on="snp_chr", how="left")
     pred_df = pred_df.join(protein_df, on="Ensembl_proteinid", how="left")
-    pred_df = pred_df.select(["id", *col_list, "snp_id","protein_id"])
+    pred_df = pred_df.withColumn("id", monotonically_increasing_id())
 
-    # writing to mariadb
-    pred_df.createOrReplaceTempView("pred_view")
-    pred_df.write.mode("overwrite").saveAsTable("Ogkourlias.pred_table").option("driver","org.mariadb.jdbc.Driver").option("url", f"jdbc:mariadb://mariadb.bin.bioinf.nl/Ogkourlias")
-
-
+    pred_final_cols = ["id"] + top5 + ["snp_id", "protein_id"]
+    pred_df = pred_df.select(*pred_final_cols)
     
-def main(args):
-    """Main function"""
+    jdbc_url = "jdbc:mariadb://mariadb.bin.bioinf.nl/Ogkourlias"
+    jdbc_props = {
+        "driver": "org.mariadb.jdbc.Driver",
+        "user": user,
+        "password": password,
+    }
+
+    pred_df.write.format("jdbc") \
+        .mode("overwrite") \
+        .option("url", jdbc_url) \
+        .option("dbtable", "pred_table") \
+        .option("driver", jdbc_props["driver"]) \
+        .option("user", jdbc_props["user"]) \
+        .option("password", jdbc_props["password"]) \
+        .option("batchsize", "10000") \
+        .option("numPartitions", "8") \
+        .save()
+
+    snp_df.write.format("jdbc") \
+        .mode("overwrite") \
+        .option("url", jdbc_url) \
+        .option("dbtable", "snp_table") \
+        .option("driver", jdbc_props["driver"]) \
+        .option("user", jdbc_props["user"]) \
+        .option("password", jdbc_props["password"]) \
+        .option("batchsize", "10000") \
+        .option("numPartitions", "4") \
+        .save()
+
+    protein_df.write.format("jdbc") \
+        .mode("overwrite") \
+        .option("url", jdbc_url) \
+        .option("dbtable", "protein_table") \
+        .option("driver", jdbc_props["driver"]) \
+        .option("user", jdbc_props["user"]) \
+        .option("password", jdbc_props["password"]) \
+        .option("batchsize", "10000") \
+        .option("numPartitions", "4") \
+        .save()
+
+
+def main():
     args = argparser()
-    parse_file(args.input)
-    return 0
+    user, password = read_db_credentials()
+    spark = create_spark()
+    parse_file(spark, args.input, user, password)
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    main()
